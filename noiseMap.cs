@@ -1,16 +1,26 @@
 using UnityEngine;
 using Unity.Mathematics;
 
+public struct NoiseMapResult
+{
+    public float[,] noiseMap;
+    public float minHeight;
+    public float maxHeight;
+}
+
 public static class NoiseMapGenerator
 {
-    public static float[,] GenerateNoiseMap(
+    public enum NormalizeMode { Local, Global }
+
+    public static NoiseMapResult GenerateNoiseMap(
         int seed, int width, int height,
         float scale,
         int octaves,
         float persistence,
         float lacunarity,
         Vector2 offset,
-        float weight // added to match your ridge noise weight
+        float weight,
+        NormalizeMode normalizeMode
     )
     {
         float[,] noiseMap = new float[width, height];
@@ -20,32 +30,35 @@ public static class NoiseMapGenerator
 
         System.Random prng = new System.Random(seed);
         Vector2[] octaveOffsets = new Vector2[octaves];
+
         for (int i = 0; i < octaves; i++)
         {
-            float offsetX = prng.Next(-100000, 100000) + offset.x;
-            float offsetY = prng.Next(-100000, 100000) + offset.y;
+            float offsetX = prng.Next(-100000, 100000);
+            float offsetY = prng.Next(-100000, 100000);
             octaveOffsets[i] = new Vector2(offsetX, offsetY);
         }
 
         float maxNoiseHeight = float.MinValue;
         float minNoiseHeight = float.MaxValue;
 
-        float halfWidth = width / 2f;
-        float halfHeight = height / 2f;
-
+        // STEP 1: Generate raw noise values
         for (int y = 0; y < height; y++)
         {
             for (int x = 0; x < width; x++)
             {
-                float2 pos = new float2(x, y);
-                float noiseHeight = 0;
+                // CRITICAL FIX: Changed 'offset.y + y' to 'offset.y - y'
+                // This aligns the noise sampling direction (North->South) 
+                // with the MeshGenerator's loop direction (Index 0 is +Z/North).
+                float2 worldPos = new float2(offset.x + x, offset.y - y);
 
-                // Example: you can choose which noise to use here — ridge or simplex
-                // For demo, let's mix half ridge, half simplex like your original:
-                float ridgeVal = OctavedRidgeNoise(pos, seed, scale, octaves, lacunarity, persistence, octaveOffsets, width, height, weight);
-                float simplexVal = OctavedSimplexNoise(pos, seed, scale, octaves, lacunarity, persistence, octaveOffsets, width, height);
+                float ridgeVal = OctavedRidgeNoise(worldPos, seed, scale, octaves, lacunarity, persistence, octaveOffsets, weight);
+                float simplexVal = OctavedSimplexNoise(worldPos, seed, scale, octaves, lacunarity, persistence, octaveOffsets);
+                float noiseHeight = (ridgeVal + simplexVal) / 2f;
 
-                noiseHeight = (ridgeVal + simplexVal) / 2f;
+                if (float.IsNaN(noiseHeight) || float.IsInfinity(noiseHeight) || Mathf.Abs(noiseHeight) > 1000f)
+                {
+                    noiseHeight = 0.5f;
+                }
 
                 if (noiseHeight > maxNoiseHeight) maxNoiseHeight = noiseHeight;
                 if (noiseHeight < minNoiseHeight) minNoiseHeight = noiseHeight;
@@ -54,72 +67,132 @@ public static class NoiseMapGenerator
             }
         }
 
-        // Normalize noiseMap values to [0,1]
-        for (int y = 0; y < height; y++)
-            for (int x = 0; x < width; x++)
-                noiseMap[x, y] = Mathf.InverseLerp(minNoiseHeight, maxNoiseHeight, noiseMap[x, y]);
+        // STEP 2: Normalize based on mode
+        if (normalizeMode == NormalizeMode.Local)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                for (int x = 0; x < width; x++)
+                {
+                    if (maxNoiseHeight != minNoiseHeight)
+                    {
+                        noiseMap[x, y] = Mathf.InverseLerp(minNoiseHeight, maxNoiseHeight, noiseMap[x, y]);
+                    }
+                    else
+                    {
+                        noiseMap[x, y] = 0.5f;
+                    }
+                }
+            }
+        }
+        else // Global mode
+        {
+            float gMin, gMax;
+            EndlessTerrain.GetGlobalBounds(out gMin, out gMax);
 
-        return noiseMap;
+            if (float.IsNaN(gMin) || float.IsNaN(gMax) ||
+                float.IsInfinity(gMin) || float.IsInfinity(gMax) ||
+                Mathf.Approximately(gMax, gMin) ||
+                !EndlessTerrain.globalHeightPrecomputed)
+            {
+                Debug.LogWarning("Invalid global bounds, falling back to local normalization for this chunk");
+                for (int y = 0; y < height; y++)
+                {
+                    for (int x = 0; x < width; x++)
+                    {
+                        if (maxNoiseHeight != minNoiseHeight)
+                        {
+                            noiseMap[x, y] = Mathf.InverseLerp(minNoiseHeight, maxNoiseHeight, noiseMap[x, y]);
+                        }
+                        else
+                        {
+                            noiseMap[x, y] = 0.5f;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                for (int y = 0; y < height; y++)
+                {
+                    for (int x = 0; x < width; x++)
+                    {
+                        float normalizedValue = Mathf.InverseLerp(gMin, gMax, noiseMap[x, y]);
+                        if (float.IsNaN(normalizedValue) || float.IsInfinity(normalizedValue))
+                        {
+                            normalizedValue = 0.5f;
+                        }
+                        noiseMap[x, y] = Mathf.Clamp01(normalizedValue);
+                    }
+                }
+            }
+        }
+
+        return new NoiseMapResult
+        {
+            noiseMap = noiseMap,
+            minHeight = minNoiseHeight,
+            maxHeight = maxNoiseHeight
+        };
     }
 
     private static float OctavedRidgeNoise(
-        float2 pos, int seed, float scale, int octaves, float lacunarity, float persistence,
-        Vector2[] octaveOffsets, int width, int height, float weight)
+        float2 worldPos, int seed, float scale, int octaves, float lacunarity, float persistence,
+        Vector2[] octaveOffsets, float weight)
     {
         float noiseVal = 0f;
         float amplitude = 1f;
         float frequency = 1f;
         float currentWeight = 1f;
-
-        float halfWidth = width / 2f;
-        float halfHeight = height / 2f;
+        float maxValue = 0f;
 
         for (int i = 0; i < octaves; i++)
         {
-            float sampleX = (pos.x - halfWidth) / scale * frequency + octaveOffsets[i].x;
-            float sampleY = (pos.y - halfHeight) / scale * frequency + octaveOffsets[i].y;
+            float sampleX = (worldPos.x + octaveOffsets[i].x) / scale * frequency;
+            float sampleY = (worldPos.y + octaveOffsets[i].y) / scale * frequency;
 
-            float n = OpenSimplex2S.Noise2_ImproveX(seed, sampleX, sampleY);
-            float v = 1f - Mathf.Abs(n);
-            v *= v;
-            v *= currentWeight;
+            float n = OpenSimplex2S.Noise2_ImproveX(seed + i, sampleX, sampleY);
+            float ridge = 1f - Mathf.Abs(n);
 
-            currentWeight = Mathf.Clamp01(v * weight);
+            ridge = Mathf.Pow(ridge, Mathf.Clamp(weight, 0.1f, 10f));
+            ridge *= currentWeight;
 
-            noiseVal += v * amplitude;
+            currentWeight = Mathf.Clamp01(ridge * weight);
+
+            noiseVal += ridge * amplitude;
+            maxValue += amplitude;
 
             frequency *= lacunarity;
             amplitude *= persistence;
         }
 
-        return noiseVal;
+        return maxValue > 0f ? noiseVal / maxValue : 0f;
     }
 
     private static float OctavedSimplexNoise(
-        float2 pos, int seed, float scale, int octaves, float lacunarity, float persistence,
-        Vector2[] octaveOffsets, int width, int height)
+        float2 worldPos, int seed, float scale, int octaves, float lacunarity, float persistence,
+        Vector2[] octaveOffsets)
     {
         float noiseVal = 0f;
         float amplitude = 1f;
         float frequency = 1f;
-
-        float halfWidth = width / 2f;
-        float halfHeight = height / 2f;
+        float maxValue = 0f;
 
         for (int i = 0; i < octaves; i++)
         {
-            float sampleX = (pos.x - halfWidth) / scale * frequency + octaveOffsets[i].x;
-            float sampleY = (pos.y - halfHeight) / scale * frequency + octaveOffsets[i].y;
+            float sampleX = (worldPos.x + octaveOffsets[i].x) / scale * frequency;
+            float sampleY = (worldPos.y + octaveOffsets[i].y) / scale * frequency;
 
-            float n = OpenSimplex2S.Noise2_ImproveX(seed, sampleX, sampleY);
+            float n = Unity.Mathematics.noise.snoise(new float2(sampleX, sampleY));
             float v = (n + 1f) / 2f;
 
             noiseVal += v * amplitude;
+            maxValue += amplitude;
 
             frequency *= lacunarity;
             amplitude *= persistence;
         }
 
-        return noiseVal;
+        return maxValue > 0f ? noiseVal / maxValue : 0.5f;
     }
 }
