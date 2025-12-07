@@ -3,26 +3,41 @@ using System.Collections;
 
 public static class MeshGenerator
 {
-
-    public static MeshData GenerateTerrainMesh(float[,] heightMap, float heightMultiplier, AnimationCurve heightCurve,int levelOfDetail)
+    public static MeshData GenerateTerrainMesh(float[,] heightMap, float heightMultiplier, AnimationCurve _heightCurve, int levelOfDetail, Vector2 worldOffset = default)
     {
+        AnimationCurve heightCurve = new AnimationCurve(_heightCurve.keys);
         int width = heightMap.GetLength(0);
         int height = heightMap.GetLength(1);
+
+        // CRITICAL FIX: Center mesh around local (0,0) for proper Transform positioning
         float topLeftX = (width - 1) / -2f;
         float topLeftZ = (height - 1) / 2f;
 
-        int MeshSimplificationIncrement = (levelOfDetail == 0)?1:levelOfDetail * 2 ;
-        int verticesPerLine = (width - 1) / MeshSimplificationIncrement + 1 ;
+        int meshSimplificationIncrement = (levelOfDetail == 0) ? 1 : levelOfDetail * 2;
+        int verticesPerLine = (width - 1) / meshSimplificationIncrement + 1;
 
-        MeshData meshData = new MeshData(width, height);
+        MeshData meshData = new MeshData(verticesPerLine, verticesPerLine);
         int vertexIndex = 0;
 
-        for (int y = 0; y < height; y+= MeshSimplificationIncrement)
+        for (int y = 0; y < height; y += meshSimplificationIncrement)
         {
-            for (int x = 0; x < width; x+= MeshSimplificationIncrement)
+            for (int x = 0; x < width; x += meshSimplificationIncrement)
             {
+                float heightValue = heightMap[x, y];
 
-                meshData.vertices[vertexIndex] = new Vector3(topLeftX + x, heightCurve.Evaluate(heightMap[x, y]) * heightMap[x, y] * heightMultiplier, topLeftZ - y);
+                // Safety check
+                if (float.IsNaN(heightValue) || float.IsInfinity(heightValue))
+                {
+                    heightValue = 0f;
+                }
+
+                // CRITICAL FIX: Position vertices relative to mesh center (not world position)
+                // The GameObject's transform will handle world positioning
+                float localX = topLeftX + x;
+                float localZ = topLeftZ - y;
+                float localY = heightCurve.Evaluate(heightValue) * heightMultiplier;
+
+                meshData.vertices[vertexIndex] = new Vector3(localX, localY, localZ);
                 meshData.uvs[vertexIndex] = new Vector2(x / (float)width, y / (float)height);
 
                 if (x < width - 1 && y < height - 1)
@@ -36,7 +51,6 @@ public static class MeshGenerator
         }
 
         return meshData;
-
     }
 }
 
@@ -45,7 +59,6 @@ public class MeshData
     public Vector3[] vertices;
     public int[] triangles;
     public Vector2[] uvs;
-
     int triangleIndex;
 
     public MeshData(int meshWidth, int meshHeight)
@@ -72,5 +85,4 @@ public class MeshData
         mesh.RecalculateNormals();
         return mesh;
     }
-
 }
